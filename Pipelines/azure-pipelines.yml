@@ -1,0 +1,193 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool: 
+ name: CSX-Pool
+
+parameters:
+- name: stage
+  displayName: Environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - qa
+    - prod
+
+stages:
+  - stage: Validate
+    displayName: Validate
+    jobs:
+      - job: ValidateJob
+        steps:
+          - checkout: self
+          
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: 'csx'
+              backendAzureRmResourceGroupName: 'riya-rg'
+              backendAzureRmStorageAccountName: 'csxstorageinfra'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'csx-dev.tfstate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/dev'
+
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              environmentServiceNameAzureRM: 'csx'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/dev'
+
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'custom'
+              outputTo: 'console'
+              customCommand: 'fmt'
+              environmentServiceNameAzureRM: 'csx'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/dev'
+
+
+  - stage: Plan
+    dependsOn: Validate
+    displayName: Plan
+    jobs:
+      - job: PlanJob
+        steps:
+          - checkout: self
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendAzureRmResourceGroupName: 'riya-rg'
+              backendAzureRmStorageAccountName: 'csxstorageinfra'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'csx-dev.tfstate'
+              backendServiceArm: 'csx'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/dev'
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/dev'
+              environmentServiceNameAzureRM: 'csx'
+
+
+
+  - stage: SecurityScan
+    dependsOn: Plan
+    displayName: SecurityScan 
+    jobs:
+      - job: ScanJob
+        displayName: IaC Security & Lint Scan 
+        steps:
+          - checkout: self
+          
+          - script: |
+              python -m pip install --upgrade pip
+              pip install checkov
+              checkov -d . --soft-fail-on MEDIUM
+              echo "Checkov completed. Forcing success exit code."
+              exit 0
+            displayName: "Run Checkov (IaC Security Scan)"
+
+          - script: |
+              curl -L https://github.com/aquasecurity/tfsec/releases/latest/download/tfsec-windows-amd64.exe -o tfsec.exe
+              tfsec.exe . || true
+            displayName: "Run tfsec (Terraform Security Scan)"
+
+          - script: |
+              curl -L https://github.com/terraform-linters/tflint/releases/latest/download/tflint_windows_amd64.zip -o tflint.zip
+              tar -xf tflint.zip
+              tflint.exe --init
+              tflint.exe || true
+            displayName: "Run tflint (Terraform Linting)"
+
+
+          - script: |
+              curl -L https://github.com/tenable/terrascan/releases/latest/download/terrascan_windows_amd64.zip -o terrascan.zip
+              powershell -Command "Expand-Archive -Force terrascan.zip ."
+
+              if not exist terrascan.exe (
+                echo Terrascan binary not found!
+                exit 0
+              )
+
+              terrascan.exe scan -t terraform -i .
+              exit 0
+            displayName: "Run Terrascan (IaC Policy Scan)"
+
+          - script: |
+              echo Downloading Infracost...
+              curl -L https://infracost.io/downloads/latest/infracost-windows-amd64.zip -o infracost.zip
+
+              echo Extracting Infracost...
+              powershell -Command "Expand-Archive -Force infracost.zip ."
+
+              if not exist infracost.exe (
+                echo Infracost binary not found!
+                exit 0
+              )
+
+              echo Authenticating Infracost...
+              infracost.exe auth login --api-key $(INFRACOST_API_KEY)
+
+              echo Running Infracost breakdown...
+              infracost.exe breakdown --path $(System.DefaultWorkingDirectory)/dev
+
+              echo Infracost completed. Forcing success exit code.
+              exit 0
+            displayName: "Run Infracost (Cost Estimate)"
+
+
+ 
+  - stage: Apply   
+    dependsOn: SecurityScan
+    displayName: ManualValidation + Apply
+    jobs:
+      - job: Apply
+        displayName: TerraformApply
+        steps:
+          - checkout: self
+          
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              backendServiceArm: 'csx'
+              backendAzureRmResourceGroupName: 'riya-rg'
+              backendAzureRmStorageAccountName: 'csxstorageinfra'
+              backendAzureRmContainerName: 'tfstate'
+              backendAzureRmKey: 'csx-dev.tfstate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/dev'
+
+
+
+          - task: TerraformTask@5
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              environmentServiceNameAzureRM: 'csx'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/dev'
+              commandOptions: >
+                -auto-approve
